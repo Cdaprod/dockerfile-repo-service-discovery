@@ -52,6 +52,15 @@ jobs:
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: 'npm'
+
+      - name: Install dependencies and generate lock file
+        run: |
+          npm install
+          # Ensure the package-lock.json is generated
+          if [ ! -f package-lock.json ]; then
+            echo "Error: package-lock.json was not generated."
+            exit 1
+          fi 
           
       - name: Cache dependencies
         id: npm-cache
