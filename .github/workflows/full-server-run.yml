@@ -77,10 +77,16 @@ jobs:
           npm ci
           npx playwright install chromium
           
+      - name: Start services using Docker Compose
+        run: |
+          if [ -f "docker-compose.yml" ]; then
+            docker compose up -d
+          fi
+
       - name: Start parsing server
         id: parser
         run: |
-          # Start the parsing server in background
+          # Start the parsing server in the background
           node src/parsing-server.js &
           PARSER_PID=$!
           
@@ -88,7 +94,7 @@ jobs:
           echo "PARSER_PID=${PARSER_PID}" >> $GITHUB_ENV
           
           # Wait for server to be ready
-          timeout=30
+          timeout=60  # Increased timeout to accommodate service startup
           while [ $timeout -gt 0 ]; do
             if curl -s http://localhost:3000/health | grep -q "healthy"; then
               echo "Parser is healthy."
@@ -158,16 +164,14 @@ jobs:
       - name: Create screenshots directory
         run: mkdir -p ${{ env.SCREENSHOT_DIR }}
           
-      - name: Start services
+      - name: Start parsing server
+        id: parser
         run: |
-          # Start all required services
-          if [ -f "docker-compose.yml" ]; then
-            docker compose up -d
-          fi
-          
-          # Start parsing server
+          # Start the parsing server in the background
           node src/parsing-server.js &
           PARSER_PID=$!
+          
+          # Export PARSER_PID to be accessible in subsequent steps
           echo "PARSER_PID=${PARSER_PID}" >> $GITHUB_ENV
           
           # Wait for server to be ready
@@ -183,6 +187,7 @@ jobs:
           
           if [ $timeout -le 0 ]; then
             echo "Parser failed to start"
+            kill $PARSER_PID
             exit 1
           fi
       
