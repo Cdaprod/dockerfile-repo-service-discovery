@@ -20,7 +20,7 @@
   "dependencies": {
     "playwright": "^1.49.0",
     "docker-file-parser": "^1.0.7",
-    "yaml": "^2.61",
+    "yaml": "^2.6.1",
     "@actions/core": "^1.11.1",
     "@actions/github": "^6.0.0"
   },
