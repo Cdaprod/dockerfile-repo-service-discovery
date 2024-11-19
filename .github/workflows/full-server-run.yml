@@ -1,4 +1,4 @@
-name: Service Screenshot & Documentation
+name: Full Server Deployment Service Screenshot & Documentation
 
 on:
   workflow_dispatch:
