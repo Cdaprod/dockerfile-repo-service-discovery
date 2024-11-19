@@ -1,0 +1,343 @@
+name: Service Screenshot & Documentation
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to screenshot'
+        required: true
+        default: 'preview'
+        type: choice
+        options:
+          - preview
+          - staging
+          - production
+      force_refresh:
+        description: 'Force refresh all screenshots'
+        required: false
+        type: boolean
+        default: false
+  push:
+    branches: [ main, develop ]
+    paths:
+      - 'src/**'
+      - 'Dockerfile*'
+      - 'docker-compose*.yml'
+      - '.github/workflows/screenshot.yml'
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - 'src/**'
+      - 'Dockerfile*'
+      - 'docker-compose*.yml'
+      - '.github/workflows/screenshot.yml'
+
+env:
+  NODE_VERSION: '20'
+  SCREENSHOT_DIR: 'public/assets/screenshots'
+  CACHE_KEY_PREFIX: 'v1'
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+      cache-hit: ${{ steps.npm-cache.outputs.cache-hit }}
+    
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          
+      - name: Cache dependencies
+        id: npm-cache
+        uses: actions/cache@v3
+        with:
+          path: |
+            **/node_modules
+            ~/.cache/ms-playwright
+          key: ${{ env.CACHE_KEY_PREFIX }}-${{ runner.os }}-modules-${{ hashFiles('**/package-lock.json') }}
+          
+      - name: Install dependencies
+        if: steps.npm-cache.outputs.cache-hit != 'true'
+        run: |
+          npm ci
+          npx playwright install chromium
+          
+      - name: Start parsing server
+        id: parser
+        run: |
+          # Start the parsing server in background
+          node src/parsing-server.js &
+          PARSER_PID=$!
+          
+          # Export PARSER_PID to be accessible in subsequent steps
+          echo "PARSER_PID=${PARSER_PID}" >> $GITHUB_ENV
+          
+          # Wait for server to be ready
+          timeout=30
+          while [ $timeout -gt 0 ]; do
+            if curl -s http://localhost:3000/health | grep -q "healthy"; then
+              echo "Parser is healthy."
+              break
+            fi
+            timeout=$((timeout - 1))
+            sleep 1
+          done
+          
+          if [ $timeout -le 0 ]; then
+            echo "Parser failed to start"
+            kill $PARSER_PID
+            exit 1
+          fi
+          
+          # Get discovered services
+          curl -s http://localhost:3000/services > services.json
+          
+          # Format for matrix
+          echo "matrix=$(jq -c '{ include: . }' services.json)" >> $GITHUB_OUTPUT
+          
+      - name: Set matrix
+        id: set-matrix
+        run: |
+          if [ -f services.json ] && [ -s services.json ]; then
+            echo "matrix=$(jq -c '{ include: . }' services.json)" >> $GITHUB_OUTPUT
+          else
+            echo "matrix=$(jq -c '{ include: [{ name: \"default\", url: \"http://localhost:3000\" }] }')" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Stop parsing server
+        if: always()
+        run: |
+          if [ -n "${{ env.PARSER_PID }}" ]; then
+            kill ${{ env.PARSER_PID }} || true
+          fi
+
+  screenshot:
+    needs: prepare
+    runs-on: ubuntu-latest
+    strategy:
+      matrix: ${{ fromJson(needs.prepare.outputs.matrix) }}
+      fail-fast: false
+      max-parallel: 3
+    
+    steps:
+      - uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          
+      - name: Restore cache
+        uses: actions/cache@v3
+        with:
+          path: |
+            **/node_modules
+            ~/.cache/ms-playwright
+          key: ${{ env.CACHE_KEY_PREFIX }}-${{ runner.os }}-modules-${{ hashFiles('**/package-lock.json') }}
+          
+      - name: Install dependencies
+        if: steps.npm-cache.outputs.cache-hit != 'true'
+        run: |
+          npm ci
+          npx playwright install chromium
+          
+      - name: Create screenshots directory
+        run: mkdir -p ${{ env.SCREENSHOT_DIR }}
+          
+      - name: Start services
+        run: |
+          # Start all required services
+          if [ -f "docker-compose.yml" ]; then
+            docker compose up -d
+          fi
+          
+          # Start parsing server
+          node src/parsing-server.js &
+          PARSER_PID=$!
+          echo "PARSER_PID=${PARSER_PID}" >> $GITHUB_ENV
+          
+          # Wait for server to be ready
+          timeout=30
+          while [ $timeout -gt 0 ]; do
+            if curl -s http://localhost:3000/health | grep -q "healthy"; then
+              echo "Parser is healthy."
+              break
+            fi
+            timeout=$((timeout - 1))
+            sleep 1
+          done
+          
+          if [ $timeout -le 0 ]; then
+            echo "Parser failed to start"
+            exit 1
+          fi
+      
+      - name: Take screenshots
+        env:
+          SERVICE_URL: ${{ matrix.url }}
+          SERVICE_NAME: ${{ matrix.name }}
+          FORCE_REFRESH: ${{ inputs.force_refresh }}
+        run: |
+          # Wait for service to be ready
+          SERVICE_JSON=$(curl -s http://localhost:3000/services | jq -r '.[] | select(.name == "'"${SERVICE_NAME}"'")')
+          
+          if [ -n "$SERVICE_JSON" ]; then
+            echo "Service found, taking screenshots..."
+            # Screenshots are taken automatically by the parsing server
+            # Just wait for the metadata file to appear
+            timeout=300
+            while [ $timeout -gt 0 ]; do
+              if [ -f "${{ env.SCREENSHOT_DIR }}/${SERVICE_NAME}-metadata.json" ]; then
+                echo "Screenshot metadata found for ${SERVICE_NAME}."
+                break
+              fi
+              timeout=$((timeout - 1))
+              sleep 1
+            done
+          
+            if [ $timeout -le 0 ]; then
+              echo "Timeout waiting for screenshots for ${SERVICE_NAME}"
+              exit 1
+            fi
+          else
+            echo "Service not found: ${SERVICE_NAME}"
+            exit 1
+          fi
+          
+      - name: Stop parsing server
+        if: always()
+        run: |
+          if [ -n "${{ env.PARSER_PID }}" ]; then
+            kill ${{ env.PARSER_PID }} || true
+          fi
+          
+      - name: Upload screenshots
+        uses: actions/upload-artifact@v3
+        with:
+          name: screenshots-${{ matrix.name }}
+          path: ${{ env.SCREENSHOT_DIR }}
+          retention-days: 7
+
+  publish:
+    needs: screenshot
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    
+    steps:
+      - uses: actions/checkout@v3
+        
+      - name: Download all screenshots
+        uses: actions/download-artifact@v3
+        with:
+          path: ${{ env.SCREENSHOT_DIR }}
+          
+      - name: Reorganize artifacts
+        run: |
+          cd ${{ env.SCREENSHOT_DIR }}
+          for dir in screenshots-*; do
+            if [ -d "$dir" ]; then
+              mv "$dir"/* ./
+              rmdir "$dir"
+            fi
+          done
+          
+      - name: Generate index
+        run: |
+          echo "# Service Screenshots" > ${{ env.SCREENSHOT_DIR }}/index.md
+          echo "Last updated: $(date -u)" >> ${{ env.SCREENSHOT_DIR }}/index.md
+          echo "" >> ${{ env.SCREENSHOT_DIR }}/index.md
+          
+          for metadata in ${{ env.SCREENSHOT_DIR }}/*-metadata.json; do
+            if [ -f "$metadata" ]; then
+              service=$(jq -r '.service' "$metadata")
+              url=$(jq -r '.url' "$metadata")
+              timestamp=$(jq -r '.timestamp' "$metadata")
+              echo "## $service" >> ${{ env.SCREENSHOT_DIR }}/index.md
+              echo "- URL: $url" >> ${{ env.SCREENSHOT_DIR }}/index.md
+              echo "- Updated: $timestamp" >> ${{ env.SCREENSHOT_DIR }}/index.md
+              echo "" >> ${{ env.SCREENSHOT_DIR }}/index.md
+            fi
+          done
+          
+      - name: Commit changes
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          
+          git add ${{ env.SCREENSHOT_DIR }}
+          
+          if git diff --staged --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "Update screenshots [skip ci]
+            
+            Automated screenshot update for:
+            $(git diff --staged --name-only | grep -o '[^/]*$' | sed 's/-metadata.json//' | sort -u | sed 's/^/- /')"
+            
+            git push
+          fi
+
+  cleanup:
+    needs: screenshot
+    if: always()
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Delete old artifacts
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const retention = 7 * 24 * 60 * 60 * 1000; // 7 days in milliseconds
+            const now = new Date();
+            
+            const { data: artifacts } = await github.rest.actions.listArtifactsForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+            });
+            
+            for (const artifact of artifacts) {
+              const created = new Date(artifact.created_at);
+              if (now - created > retention) {
+                console.log(`Deleting old artifact: ${artifact.name}`);
+                await github.rest.actions.deleteArtifact({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  artifact_id: artifact.id,
+                });
+              }
+            }
+
+  notify:
+    needs: [screenshot, publish]
+    if: always()
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Check workflow status
+        id: check
+        run: |
+          if [ "${{ needs.screenshot.result }}" = "success" ] && [ "${{ needs.publish.result }}" = "success" ]; then
+            echo "status=success" >> $GITHUB_OUTPUT
+          else
+            echo "status=failure" >> $GITHUB_OUTPUT
+          fi
+          
+      - name: Notify success
+        if: steps.check.outputs.status == 'success'
+        run: |
+          echo "::notice::Screenshots updated successfully!"
+          
+      - name: Notify failure
+        if: steps.check.outputs.status == 'failure'
+        run: |
+          echo "::error::Screenshot workflow failed. Check the logs for details."

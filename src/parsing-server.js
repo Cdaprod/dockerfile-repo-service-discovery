@@ -12,7 +12,7 @@ class ParsingServer {
   constructor(options = {}) {
     this.options = {
       port: process.env.PORT || 3000,
-      screenshotDir: './public/assets/screenshots',
+      screenshotDir: process.env.SCREENSHOT_DIR || './public/assets/screenshots',
       scanInterval: 30000, // 30 seconds
       maxRetries: 5,
       waitBetweenRetries: 5000,
@@ -58,10 +58,15 @@ class ParsingServer {
       res.end('Not found');
     });
 
-    return new Promise((resolve) => {
+    return new Promise((resolve, reject) => {
       this.server.listen(this.options.port, () => {
         console.log(`Parsing server listening on port ${this.options.port}`);
         resolve();
+      });
+
+      this.server.on('error', (err) => {
+        console.error('Server error:', err);
+        reject(err);
       });
     });
   }
@@ -118,7 +123,13 @@ class ParsingServer {
     };
 
     async function scan(dir) {
-      const entries = await fs.readdir(dir, { withFileTypes: true });
+      let entries;
+      try {
+        entries = await fs.readdir(dir, { withFileTypes: true });
+      } catch (err) {
+        console.error(`Failed to read directory ${dir}:`, err);
+        return;
+      }
 
       for (const entry of entries) {
         const fullPath = path.join(dir, entry.name);
@@ -147,14 +158,30 @@ class ParsingServer {
 
     // Parse Dockerfiles
     for (const file of files.dockerfiles) {
-      const content = await fs.readFile(file, 'utf-8');
-      const parsedDocker = parseDockerfile(content);
+      let content;
+      try {
+        content = await fs.readFile(file, 'utf-8');
+      } catch (err) {
+        console.error(`Failed to read Dockerfile ${file}:`, err);
+        continue;
+      }
+
+      let parsedDocker;
+      try {
+        parsedDocker = parseDockerfile(content);
+      } catch (err) {
+        console.error(`Failed to parse Dockerfile ${file}:`, err);
+        continue;
+      }
       
       const exposedPorts = parsedDocker
         .filter(cmd => cmd.name === 'EXPOSE')
         .flatMap(cmd => cmd.args);
 
       const name = path.basename(path.dirname(file));
+      if (services[name]) {
+        console.warn(`Duplicate service name detected: ${name}. Overwriting previous entry.`);
+      }
       services[name] = {
         type: 'dockerfile',
         file,
@@ -170,11 +197,27 @@ class ParsingServer {
 
     // Parse docker-compose files
     for (const file of files.composeFiles) {
-      const content = await fs.readFile(file, 'utf-8');
-      const compose = parseYaml(content);
+      let content;
+      try {
+        content = await fs.readFile(file, 'utf-8');
+      } catch (err) {
+        console.error(`Failed to read docker-compose file ${file}:`, err);
+        continue;
+      }
+
+      let compose;
+      try {
+        compose = parseYaml(content);
+      } catch (err) {
+        console.error(`Failed to parse docker-compose file ${file}:`, err);
+        continue;
+      }
 
       if (compose.services) {
         for (const [name, service] of Object.entries(compose.services)) {
+          if (services[name]) {
+            console.warn(`Duplicate service name detected: ${name}. Overwriting previous entry.`);
+          }
           services[name] = {
             type: 'compose',
             file,
@@ -191,6 +234,8 @@ class ParsingServer {
   }
 
   async screenshotServices() {
+    const screenshotPromises = [];
+
     for (const [name, service] of this.services) {
       const ports = service.exposedPorts || [];
       
@@ -201,15 +246,16 @@ class ParsingServer {
         ];
 
         for (const url of urls) {
-          try {
-            await this.takeScreenshot(name, url);
-            break; // If successful, move to next port
-          } catch (error) {
-            console.log(`Failed to screenshot ${url}:`, error.message);
-          }
+          screenshotPromises.push(
+            this.takeScreenshot(name, url).catch(error => {
+              console.log(`Failed to screenshot ${url}:`, error.message);
+            })
+          );
         }
       }
     }
+
+    await Promise.all(screenshotPromises);
   }
 
   async takeScreenshot(serviceName, url) {
