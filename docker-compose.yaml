@@ -1,0 +1,50 @@
+version: '3.8'
+
+services:
+  # Main service discovery service
+  service-discovery:
+    build: .
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./src:/app/src
+      - ./public:/app/public
+    environment:
+      - NODE_ENV=development
+      - PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
+    command: npm start
+
+  # Test services for discovery
+  test-static:
+    image: nginx:alpine
+    ports:
+      - "8081:80"
+    volumes:
+      - ./test/static:/usr/share/nginx/html
+    labels:
+      - "service.type=static"
+
+  test-dynamic:
+    image: node:20-alpine
+    ports:
+      - "8082:3000"
+    volumes:
+      - ./test/dynamic:/app
+    working_dir: /app
+    command: node server.js
+    labels:
+      - "service.type=dynamic"
+
+  test-preview:
+    image: nginx:alpine
+    ports:
+      - "8083:80"
+    volumes:
+      - ./test/preview:/usr/share/nginx/html
+    labels:
+      - "service.type=preview"
+
+networks:
+  default:
+    name: service-discovery-network
+    driver: bridge
