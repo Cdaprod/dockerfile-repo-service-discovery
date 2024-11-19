@@ -1,6 +1,7 @@
 {
   "name": "dockerfile-service-discovery",
   "version": "1.0.0",
+  "type": "module",
   "description": "GitHub Action to discover services from Dockerfiles and capture screenshots",
   "main": "dist/index.js",
   "scripts": {
